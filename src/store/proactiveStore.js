@@ -25,6 +25,26 @@ export const BACKEND_FIRE_COOLDOWN_MS = 20 * 60 * 1000;
 //   也不白占满 20min（否则用户要等很久才收到下一条）。设成「失败那刻起 5min 后可再试」。
 export const BACKEND_FAIL_COOLDOWN_MS = 5 * 60 * 1000;
 
+// lifeState.updatedAt is a client heartbeat, not a change to the character state.
+// Keep all other fields significant, including cooldowns and interaction times.
+function sameRecordFields(previous, incoming) {
+    return Object.keys(incoming).every((key) => {
+        if (key === 'updatedAt') return true;
+        if (key === 'lifeState' && previous[key] && incoming[key]
+            && typeof previous[key] === 'object' && typeof incoming[key] === 'object') {
+            const { updatedAt: previousAt, ...previousState } = previous[key];
+            const { updatedAt: incomingAt, ...incomingState } = incoming[key];
+            return JSON.stringify(previousState) === JSON.stringify(incomingState);
+        }
+        return JSON.stringify(previous[key]) === JSON.stringify(incoming[key]);
+    });
+}
+
+function recentlySaved(record, now) {
+    return record.updatedAt && now >= record.updatedAt
+        && now - record.updatedAt < 24 * 60 * 60 * 1000;
+}
+
 export function makePairKey(inboxId, userId, charId) {
     return `${inboxId}:${String(userId)}:${String(charId)}`;
 }
@@ -159,7 +179,10 @@ class KvProactiveStore {
         const key = `p:${pairKey}`;
         const prevRaw = await this.kv.get(key);
         const prev = prevRaw ? JSON.parse(prevRaw) : {};
-        await this.kv.put(key, JSON.stringify({ ...prev, ...rec, updatedAt: rec.updatedAt || Date.now() }));
+        const now = Date.now();
+        if (!prevRaw || !sameRecordFields(prev, rec) || !recentlySaved(prev, now)) {
+            await this.kv.put(key, JSON.stringify({ ...prev, ...rec, updatedAt: now }));
+        }
         await this._addToIdx(pairKey);
     }
     async patch(inboxId, userId, charId, patch) {
@@ -169,8 +192,8 @@ class KvProactiveStore {
         const prev = JSON.parse(prevRaw);
         // 💸 内容完全没变（手机回前台补课 / 重复同步同一份滑窗）就不写：KV 免费版每天只有 1000 次写入。
         //    ⚠️ updatedAt 也不刷新——但「陈旧注册」判定看 updatedAt，内容不变超过一天仍要刷一次，免得被误判僵尸对。
-        const unchanged = Object.keys(patch).every((k) => JSON.stringify(prev[k]) === JSON.stringify(patch[k]));
-        if (unchanged && prev.updatedAt && (Date.now() - prev.updatedAt) < 24 * 60 * 60 * 1000) return true;
+        const unchanged = sameRecordFields(prev, patch);
+        if (unchanged && recentlySaved(prev, Date.now())) return true;
         await this.kv.put(key, JSON.stringify({ ...prev, ...patch, updatedAt: Date.now() }));
         return true;
     }
