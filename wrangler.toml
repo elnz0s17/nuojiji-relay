@@ -8,6 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 #    用户零操作（CF 2025 自动资源 provisioning）。
 [[kv_namespaces]]
 binding = "OUTBOX"
+id = "3804ef724b334429927b5dc2d046b107"
 
 # secret 不写这里。一键部署页会根据 .dev.vars.example 提示填；
 # 或部署后在 CF 面板 → Worker → 变量和秘密 添加：
@@ -19,3 +20,15 @@ binding = "OUTBOX"
 # 不需要主动消息可注释掉这两行。
 [triggers]
 crons = ["* * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
