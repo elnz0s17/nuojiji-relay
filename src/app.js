@@ -24,6 +24,28 @@ import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinute
 
 const VERSION = '1.1.0';
 
+// Skip duplicate long-lived maintenance values, refreshing their TTL daily.
+// The timestamp belongs to KV metadata, so stored values keep their existing format.
+export async function putIfChanged(kv, key, value, options = {}) {
+    if (typeof kv.getWithMetadata !== 'function') {
+        await kv.put(key, value, options);
+        return true;
+    }
+    const now = Date.now();
+    const previous = await kv.getWithMetadata(key, { type: 'text' });
+    const metadata = previous.metadata || {};
+    const savedAt = Number(metadata.relaySavedAt);
+    if (previous.value === value && Number.isFinite(savedAt)
+        && now >= savedAt && now - savedAt < 24 * 60 * 60 * 1000) {
+        return false;
+    }
+    await kv.put(key, value, {
+        ...options,
+        metadata: { ...metadata, ...options.metadata, relaySavedAt: now },
+    });
+    return true;
+}
+
 export function createApp() {
     const app = new Hono();
 
@@ -292,11 +314,13 @@ export function createApp() {
         const entry = subscription.channel ? subscription : { channel: channel || 'web', sub: subscription };
         try {
             const { sub } = await getStores(c.env);
-            await sub.add(inboxId, entry);
+            const changed = c.env?.OUTBOX
+                ? await putIfChanged(c.env.OUTBOX, `s:${inboxId}:${subKey(entry)}`, JSON.stringify(entry), { expirationTtl: 60 * 60 * 24 * 60 })
+                : await sub.add(inboxId, entry);
             // apns/fcm 每设备单 token：token 轮换会留下旧行，每条推送/自检都会发两遍。
             // 注册成功后清掉同 inbox 同 channel 的旧订阅，只保留这条最新的。web 多端共存不清。
             const ch = entry.channel || 'web';
-            if ((ch === 'apns' || ch === 'fcm') && typeof sub.pruneChannel === 'function') {
+            if (changed !== false && (ch === 'apns' || ch === 'fcm') && typeof sub.pruneChannel === 'function') {
                 await sub.pruneChannel(inboxId, ch, subKey(entry));
             }
         } catch (e) {
@@ -380,7 +404,7 @@ export function createApp() {
         const { kv } = await getStores(c.env);
         if (!kv) return c.json({ error: 'no store' }, 503);
         try {
-            await kv.put(`av:${key}`, JSON.stringify({ mime, b64 }), { expirationTtl: 60 * 60 * 24 * 60 }); // 60 天
+            await putIfChanged(kv, `av:${key}`, JSON.stringify({ mime, b64 }), { expirationTtl: 60 * 60 * 24 * 60 }); // 60 天
         } catch (e) {
             return c.json({ error: 'put failed', detail: String(e?.message || e) }, 500);
         }
