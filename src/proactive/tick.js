@@ -67,6 +67,66 @@ const INBOX_SLOT_CHAR = 'inbox';
 //    滑窗/人设/记忆全是一周前的快照，硬生成出来必然「前文不搭」；且多半是用户早已不用的僵尸对。
 const STALE_RECORD_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Decisions go only to Workers Logs. Never persist them in KV or log prompts,
+// conversations, credentials, subscriptions, or raw upstream error messages.
+function failureKind(error) {
+    const text = String(error?.message || error || '');
+    if (/KV put\(\).*limit exceeded/i.test(text)) return 'kv_write_quota';
+    if (/KV (get|list)\(\).*limit exceeded/i.test(text)) return 'kv_read_or_list_quota';
+    if (/HTTP (401|403)\b/.test(text)) return 'upstream_auth';
+    if (/HTTP 429\b/.test(text)) return 'upstream_rate_limit';
+    if (/abort|timeout|timed out/i.test(text)) return 'timeout';
+    return 'other';
+}
+
+function failureDescription(kind) {
+    return ({ kv_write_quota: 'KV 每日写入额度已耗尽', kv_read_or_list_quota: 'KV 读取或列出额度已耗尽',
+        upstream_auth: 'AI 服务鉴权失败', upstream_rate_limit: 'AI 服务限流',
+        timeout: '请求超时', other: '处理过程发生异常' })[kind] || '处理过程发生异常';
+}
+
+function decisionReason(rec, verdict) {
+    if (verdict?.factors?.streakHardCap != null && verdict.hardSkip) {
+        return ['unanswered_limit', `连续未回复 ${verdict.factors.unansweredStreak} 次，达到当前主动度上限 ${verdict.factors.streakHardCap} 次`];
+    }
+    if (verdict?.hardSkip) return ['schedule_skip', '当前日程不适合主动发送'];
+    if (rec.mode === 'interval') {
+        if (verdict.reason?.startsWith('interval not elapsed')) return ['interval_wait', '尚未达到角色的主动消息间隔（从最近互动或发送时间计算）'];
+        if (verdict.reason?.startsWith('quiet hours')) return ['quiet_hours', '当前处于安静时段'];
+        return ['probability_miss', '已到检查时间，本次随机概率未命中'];
+    }
+    return ['score_below_threshold', '冲动分数未达到发送门槛'];
+}
+
+function logRoleCheck(rec, tickId, result, verdict = null) {
+    try {
+        const role = String(rec.timeSpec?.charName || rec.charId || '未命名角色').replace(/[\r\n\t]/g, ' ').slice(0, 80);
+        const number = (v) => typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 1000) / 1000 : null;
+        const score = number(verdict?.score), threshold = number(verdict?.threshold);
+        const factorKeys = ['silence', 'timeOfDay', 'mood', 'pendingQuestion', 'randomLife',
+            'recentSendDamping', 'recentSkipDecay', 'streakPenalty', 'unansweredStreak',
+            'streakHardCap', 'warmupActive', 'userBias', 'safetyFloor',
+            'chitchatCooldownActive', 'chitchatCooldownBypassed', 'chitchatCooldownThresholdBump'];
+        const factors = {};
+        for (const key of factorKeys) {
+            const value = verdict?.factors?.[key];
+            if (typeof value === 'boolean') factors[key] = value;
+            else if (number(value) != null) factors[key] = number(value);
+        }
+        const scoring = score != null && threshold != null ? `；分数 ${score} / 门槛 ${threshold}` : '';
+        const entry = {
+            event: 'proactive_check', tickId, role,
+            charId: String(rec.charId || '').slice(0, 128), mode: rec.mode || 'impulse',
+            ...result, evaluated: verdict != null,
+            ...(score != null ? { score } : {}), ...(threshold != null ? { threshold } : {}),
+            ...(verdict ? { decisionFire: !!verdict.fire, factors } : {}),
+            message: `[主动检查] ${role}｜${result.checked === false ? '未检查' : '已检查'}｜${result.reason}${scoring}`,
+        };
+        if (result.status.includes('failed') || result.status === 'saved_with_error') console.warn(entry);
+        else console.info(entry);
+    } catch { /* Diagnostic logging must never interrupt message processing. */ }
+}
+
 // ⏱️ 可调检测间隔：cron 表达式固定每分钟触发（Workers 的 crons 不能读环境变量），
 //    实际几分钟检测一次见 tickConfig.js（环境变量 > App 设置页写的 KV > 默认 5 分钟），
 //    其余分钟直接跳过（只读一次缓存过的配置，零写入）。
@@ -120,8 +180,17 @@ export async function runProactiveTick(env) {
         if (typeof cur === 'number' && cur > 0) startIdx = cur % Math.max(1, allPairs.length);
     } catch { /* 不支持游标：从 0 开始 */ }
     const pairs = startIdx > 0 ? [...allPairs.slice(startIdx), ...allPairs.slice(0, startIdx)] : allPairs;
+    const tickId = String(now);
     let fired = 0;
+    let savedMessages = 0;
     let processed = 0;
+    console.info({ event: 'proactive_tick', tickId, phase: 'start', tickMinutes, roles: pairs.length,
+        message: `[主动轮次] 开始检查 ${pairs.length} 个角色，检查间隔 ${tickMinutes} 分钟` });
+    function logDeferred(fromIndex, reasonCode, reason) {
+        for (const pending of pairs.slice(fromIndex)) {
+            logRoleCheck(pending, tickId, { checked: false, status: 'deferred', reasonCode, reason });
+        }
+    }
 
     // inbox 级暂停缓存：用户走线下剧情时手机端调 /proactive/pause，该 inbox 整个跳过本轮生成。
     // 同一 inbox 多对只查一次。
@@ -138,26 +207,40 @@ export async function runProactiveTick(env) {
         // ⏱️ 墙钟预算：超了就停，剩余 pair 留到下轮（游标已记到 processed 位置）。
         if (Date.now() - tickStart > TICK_WALL_BUDGET_MS) {
             console.warn(`[proactive] tick 墙钟预算用尽，本轮处理 ${processed}/${pairs.length}，剩余下轮继续`);
+            logDeferred(processed, 'tick_time_budget', '本轮处理已超过 25 秒，尚未轮到此角色，留待下次扫描');
             break;
         }
         processed++;
+        let verdict = null;
+        let stage = 'precheck', generated = false, saved = false;
+        let pushAttempted = 0, pushSucceeded = 0, pushFailed = 0, pushStatus = 'not_started';
+        let result = { checked: true, status: 'processing_failed', reasonCode: 'interrupted', reason: '本轮处理未完成' };
         try {
             // 走线下剧情中：跳过该 inbox 的所有主动生成（用户在前台沉浸剧情，不该被线上消息打断）
-            if (await isInboxPaused(rec.inboxId)) continue;
+            if (await isInboxPaused(rec.inboxId)) {
+                result = { checked: true, status: 'skipped', reasonCode: 'inbox_paused', reason: '手机当前已暂停云端主动消息，未计算冲动分数' };
+                continue;
+            }
 
             // 🕰️ 陈旧对：手机端已很久没刷新过它（换机/卸载/关了开关但注销请求丢了）→ 不拿老上下文硬发。
             if (rec.updatedAt && (now - rec.updatedAt) > STALE_RECORD_MS) {
                 console.warn(`[proactive] 跳过陈旧注册 ${rec.userId}/${rec.charId}（${Math.round((now - rec.updatedAt) / 86400000)} 天未刷新）`);
+                result = { checked: true, status: 'skipped', reasonCode: 'stale_registration', reason: '角色注册超过 7 天未刷新，暂不使用旧上下文生成消息' };
                 continue;
             }
 
             // 后端冷却（快照早跳过，省掉后面 verdict/记忆/工具的开销）：用 listEnabled 拍的快照先粗筛。
             //    ⚠️ 这只是早跳过，不是权威判定——快照可能过期（两轮重叠 cron 都拍到旧值），
             //    权威判定在生成前用 claimFireIfStale 做 CAS（见下）。
-            if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
+            if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) {
+                const remainingMinutes = Math.ceil((rec.lastFiredAt + BACKEND_FIRE_COOLDOWN_MS - now) / 60_000);
+                result = { checked: true, status: 'skipped', reasonCode: 'role_cooldown', remainingMinutes,
+                    reason: `角色仍在发送冷却或占位期，约剩 ${remainingMinutes} 分钟，未计算冲动分数` };
+                continue;
+            }
 
             // 两种触发档：'impulse'(真人模式) / 'interval'(普通后台主动，计时+概率高中低)
-            let verdict;
+            stage = 'evaluate';
             if (rec.mode === 'interval') {
                 verdict = shouldFireInterval({
                     now, lastFiredAt: rec.lastFiredAt || 0,
@@ -195,7 +278,11 @@ export async function runProactiveTick(env) {
                 });
             }
 
-            if (!verdict.fire) continue;
+            if (!verdict.fire) {
+                const [reasonCode, reason] = decisionReason(rec, verdict);
+                result = { checked: true, status: 'not_triggered', reasonCode, reason };
+                continue;
+            }
 
             // 🔒 权威条件抢占（CAS）：在【生成之前】新读一次 lastFiredAt，仍在冷却外才抢。
             //    防三种重复:①旧码生成后才写→慢生成期间下轮重发(claimFire 生成前写已解决)
@@ -204,18 +291,26 @@ export async function runProactiveTick(env) {
             //      第一轮刚抢的值→claimFireIfStale 返回 false→跳过)。
             //    写独立 key，不走 patch(整条 blob)，否则会被 sync 覆盖。
             // 🔒 真要生成了才抢重入锁（懒抢，见上）。抢不到=别的 tick 在跑 → 本轮到此为止，交给它。
+            stage = 'tick_lock';
             if (!(await ensureTickLock())) {
                 console.warn('[proactive] 另一轮 tick 正在生成，本轮跳过剩余 pair');
+                result = { checked: true, status: 'deferred', reasonCode: 'tick_lock', reason: '已达到触发条件，但已有另一轮正在生成，本轮暂缓' };
+                logDeferred(processed, 'tick_lock', '已有另一轮正在生成，尚未轮到此角色，留待下次扫描');
                 break;
             }
+            stage = 'claim_role';
             const claimed = await proactive.claimFireIfStale(
                 rec.inboxId, rec.userId, rec.charId, now, BACKEND_FIRE_COOLDOWN_MS
             );
-            if (!claimed) continue; // 别的 tick 刚抢了这一对 → 跳过，绝不双发
+            if (!claimed) {
+                result = { checked: true, status: 'skipped', reasonCode: 'role_claim_denied', reason: '已达到触发条件，但再次确认时角色仍在冷却或已被其他轮次占位' };
+                continue;
+            }
 
             // 🔕 inbox 级全局节流：同一台手机上，不管注册了多少角色，两条主动消息之间至少隔
             //    INBOX_MIN_GAP_MS。抢不到就本轮不发（pair 槽已抢，下次自然按各自节奏重来）。
             let prevInboxFire = 0;
+            stage = 'claim_inbox';
             try { prevInboxFire = await proactive.getLastFired(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR); } catch { prevInboxFire = 0; }
             let inboxClaimed = true;
             try {
@@ -223,9 +318,17 @@ export async function runProactiveTick(env) {
                     rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, now, INBOX_MIN_GAP_MS
                 );
             } catch { inboxClaimed = true; /* 老 store 无此能力：不节流，照旧 */ }
-            if (!inboxClaimed) continue;
+            if (!inboxClaimed) {
+                result = { checked: true, status: 'skipped', reasonCode: 'inbox_cooldown',
+                    reason: '已达到触发条件，但同一手机 25 分钟内已有主动发送或占位，本角色暂缓' };
+                if (prevInboxFire && now - prevInboxFire < INBOX_MIN_GAP_MS) {
+                    result.remainingMinutes = Math.ceil((prevInboxFire + INBOX_MIN_GAP_MS - now) / 60_000);
+                }
+                continue;
+            }
 
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
+            stage = 'prepare_generation';
             let transcript = renderTranscript(rec.recentMessages, rec.timeSpec);
             // 🧠 直连第三方记忆 MCP 检索（关软件也能用最新记忆）；失败/无配置 → 空串不阻断生成。
             let memory = '';
@@ -265,6 +368,7 @@ export async function runProactiveTick(env) {
             ];
 
             let content = null, reasoning = null, error = null;
+            stage = 'generate';
             try {
                 ({ content, reasoning } = await runGeneration(rec.aiSettings, messages, rec.aiSettings?.maxTokens || null));
             } catch (e) {
@@ -276,14 +380,17 @@ export async function runProactiveTick(env) {
             //    既不会 API 持续报错时每分钟 cron 重试烧钱，又不让用户等满 20min 才收到下一条。
             //    失败不入 outbox（手机端对 error item 一律丢弃）、不发推送、不推进 lifeState/streak。
             if (error) {
+                result = { checked: true, status: 'generation_failed', reasonCode: failureKind(error),
+                    reason: `已达到触发条件，但 AI 生成失败（${failureDescription(failureKind(error))}），本次没有保存新消息或发送推送` };
+                stage = 'generation_recovery';
                 const failMark = now - (BACKEND_FIRE_COOLDOWN_MS - BACKEND_FAIL_COOLDOWN_MS);
                 await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, failMark);
                 // 生成失败没真发出消息 → 把 inbox 全局节流槽还回去，别白占 25 分钟让别的角色也哑火。
                 //   ⚠️ 传 1 而非 0：各 store 的 claimFire 对 0 走 `now || Date.now()` 会反而写成现在。
                 try { await proactive.claimFire(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, prevInboxFire || 1); } catch { /* ignore */ }
-                console.warn('[proactive] generation failed, short cooldown 5min:', error);
                 continue;
             }
+            generated = true;
 
             const requestId = `proactive_${rec.userId}_${rec.charId}_${now}`;
             const item = {
@@ -295,7 +402,10 @@ export async function runProactiveTick(env) {
                 //（滑窗同步节流没赶上），说明这条是拿旧上下文写的，会和前台回复重复 → 手机端丢弃。
                 basisAt: windowLatestAt(rec.recentMessages) || null,
             };
+            stage = 'save_message';
             await outbox.put(rec.inboxId, item);
+            saved = true;
+            savedMessages++;
 
             // 🔑 把 char 自己刚发的消息追加进后端滑窗，否则 user 一直不回复时，下次 tick 用的
             //    还是同一份旧上下文 → AI 看不到自己发过什么 → 反复说类似的话 = 重复消息。
@@ -320,6 +430,7 @@ export async function runProactiveTick(env) {
             //    user 一直不回时反复主动 = 重复消息。仅 impulse 模式自增（interval 模式不看 streak）。
             const prevStreak = (ls.unansweredStreak || 0);
             const nextStreak = (rec.mode === 'interval') ? prevStreak : prevStreak + 1;
+            stage = 'update_context';
             await proactive.patch(rec.inboxId, rec.userId, rec.charId, {
                 lifeState: { ...ls, lastImpulseAt: now, lastProactiveSentAt: now, unansweredStreak: nextStreak },
                 recentMessages: nextWindow,
@@ -332,8 +443,10 @@ export async function runProactiveTick(env) {
             // 与 /generate 路径一致（extractPushBodies 把 AI 的 JSON-Lines 拆成每个气泡一条文本）。
             // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
             //    若仍弹通知 → 用户点进聊天却没有消息 = 假通知。失败静默，等下次 tick 重试。
+            stage = 'push';
             if (!error) try {
                 const subs = await sub.list(rec.inboxId);
+                pushStatus = subs.length ? 'pending' : 'no_subscription';
                 if (subs.length) {
                     const title = rec.timeSpec?.charName || '糯叽机';
                     // 🔒 通知隐私模式：正文换「你有一条新消息」，标题(角色名)/头像保留。仍逐气泡发以保持节奏一致。
@@ -360,17 +473,36 @@ export async function runProactiveTick(env) {
                             mutableContent: true,
                         };
                         for (const s of subs) {
+                            pushAttempted++;
                             const res = await dispatchPush(env, s, payload);
+                            if (res?.ok) pushSucceeded++;
+                            else pushFailed++;
                             if (res?.gone) await sub.remove(rec.inboxId, s);
                         }
                         i++;
                     }
+                    pushStatus = pushFailed ? (pushSucceeded ? 'partial_failure' : 'failed') : 'accepted';
                 }
-            } catch (e) { console.warn('[proactive] push failed:', e?.message); }
+            } catch (e) {
+                pushStatus = 'failed';
+                pushFailed = Math.max(pushFailed, pushAttempted - pushSucceeded);
+            }
+
+            const pushDescription = pushStatus === 'accepted' ? '通知服务已接受推送（不等于手机已显示）'
+                : pushStatus === 'no_subscription' ? '没有可用推送订阅，等待 App 拉取'
+                : '通知推送未全部成功，App 仍可拉取已保存的消息';
+            result = { checked: true, status: pushStatus === 'failed' || pushStatus === 'partial_failure' ? 'push_failed' : 'generated',
+                reasonCode: pushStatus, reason: `已触发并保存消息；${pushDescription}` };
 
             fired++;
         } catch (e) {
-            console.warn('[proactive] pair tick failed:', e?.message);
+            const reasonCode = failureKind(e);
+            const detail = failureDescription(reasonCode);
+            result = { checked: true, status: saved ? 'saved_with_error' : 'processing_failed', reasonCode,
+                reason: `${saved ? '消息已保存，但后续处理失败' : '本轮未成功保存新消息'}：${detail}` };
+        } finally {
+            logRoleCheck(rec, tickId, { ...result, stage, generated, saved,
+                pushStatus, pushAttempted, pushSucceeded, pushFailed }, verdict);
         }
     }
 
@@ -381,6 +513,9 @@ export async function runProactiveTick(env) {
         if (nextCursor !== startIdx) await proactive.setTickCursor?.(nextCursor);
     } catch { /* 不支持游标：忽略 */ }
 
+    console.info({ event: 'proactive_tick', tickId, phase: 'end', roles: pairs.length,
+        processed, deferred: pairs.length - processed, fired, saved: savedMessages, elapsedMs: Date.now() - tickStart,
+        message: `[主动轮次] 本轮结束：已处理 ${processed}/${pairs.length} 个角色，生成并保存 ${savedMessages} 轮消息` });
     return { pairs: pairs.length, processed, fired };
 
     } finally {
